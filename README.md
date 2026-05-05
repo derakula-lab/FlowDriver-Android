@@ -83,7 +83,7 @@ FlowDriver ترافیک SOCKS5 رو از طریق درخواست‌های Google
      "storage_type": "google",
      "google_folder_id": "YOUR_FOLDER_ID",
      "refresh_rate_ms": 100,
-     "flush_rate_ms": 300
+     "flush_rate_ms": 100
    }
    ```
 3. Run the server:
