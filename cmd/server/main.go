@@ -109,11 +109,12 @@ func handleServerConn(sessionID, targetAddr string, session *transport.Session, 
 
 	// Conn -> Tx (Res)
 	go func() {
-		buf := make([]byte, 4096)
+		buf := make([]byte, 512*1024)
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
 				session.EnqueueTx(buf[:n])
+				engine.TriggerFlush()
 			}
 			if err != nil {
 				errCh <- err
