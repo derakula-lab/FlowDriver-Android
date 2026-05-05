@@ -35,7 +35,7 @@ type tokenCache struct {
 // via a 3-legged OAuth2 Client structure.
 type GoogleBackend struct {
 	httpClient *http.Client
-	saPath     string // Path to client_secret_*.json
+	saPath     string
 	folderID   string
 
 	clientID     string
@@ -46,7 +46,7 @@ type GoogleBackend struct {
 	token        string
 	refreshToken string
 	tokenEx      time.Time
-	mu           sync.Mutex
+	tokenMu      sync.Mutex // FIX: separate mutex for token — doesn't block file ops
 
 	// map from filename to Google Drive file ID
 	fileIDs   map[string]string
@@ -64,10 +64,9 @@ func NewGoogleBackend(client *http.Client, saPath, folderID string) *GoogleBacke
 }
 
 func (b *GoogleBackend) Login(ctx context.Context) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.tokenMu.Lock()
+	defer b.tokenMu.Unlock()
 
-	// Parse Client Secret JSON
 	data, err := os.ReadFile(b.saPath)
 	if err != nil {
 		return fmt.Errorf("failed to read Client Secret JSON %s: %w", b.saPath, err)
@@ -79,7 +78,6 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 
 	b.clientID = oauthJSON.Installed.ClientID
 	b.clientSecret = oauthJSON.Installed.ClientSecret
-	// Hardcode TokenURI to www.googleapis.com to ensure domain fronting via Host header matches
 	b.tokenURI = "https://www.googleapis.com/oauth2/v4/token"
 	authURI := oauthJSON.Installed.AuthURI
 	if len(oauthJSON.Installed.RedirectURIs) > 0 {
@@ -90,7 +88,6 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 
 	tokenCachePath := b.saPath + ".token"
 
-	// Check if we have a saved refresh token
 	if cacheData, err := os.ReadFile(tokenCachePath); err == nil {
 		var cache tokenCache
 		if err := json.Unmarshal(cacheData, &cache); err == nil && cache.RefreshToken != "" {
@@ -99,7 +96,6 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 		}
 	}
 
-	// Interactive 3-Legged Flow
 	link := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=code&scope=https://www.googleapis.com/auth/drive.file&access_type=offline",
 		authURI, url.QueryEscape(b.clientID), url.QueryEscape(b.redirectURI))
 
@@ -115,7 +111,6 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSpace(input)
 
-	// Extract code
 	code := input
 	if strings.HasPrefix(input, "http") {
 		u, err := url.Parse(input)
@@ -136,7 +131,6 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 		return err
 	}
 
-	// Save the refresh token to sidestep interactive flow next boot
 	cache := tokenCache{RefreshToken: b.refreshToken}
 	cacheBytes, _ := json.MarshalIndent(cache, "", "  ")
 	if err := os.WriteFile(tokenCachePath, cacheBytes, 0600); err != nil {
@@ -156,7 +150,6 @@ func (b *GoogleBackend) exchangeCode(ctx context.Context, code string) error {
 	v.Set("client_id", b.clientID)
 	v.Set("client_secret", b.clientSecret)
 	v.Set("redirect_uri", b.redirectURI)
-
 	return b.executeTokenRequest(ctx, v)
 }
 
@@ -166,7 +159,6 @@ func (b *GoogleBackend) refreshAccessToken(ctx context.Context) error {
 	v.Set("refresh_token", b.refreshToken)
 	v.Set("client_id", b.clientID)
 	v.Set("client_secret", b.clientSecret)
-
 	return b.executeTokenRequest(ctx, v)
 }
 
@@ -201,13 +193,13 @@ func (b *GoogleBackend) executeTokenRequest(ctx context.Context, v url.Values) e
 	if resData.RefreshToken != "" {
 		b.refreshToken = resData.RefreshToken
 	}
-	b.tokenEx = time.Now().Add(time.Duration(resData.ExpiresIn-60) * time.Second) // 60s buffer
+	b.tokenEx = time.Now().Add(time.Duration(resData.ExpiresIn-60) * time.Second)
 	return nil
 }
 
 func (b *GoogleBackend) getValidToken(ctx context.Context) (string, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.tokenMu.Lock()
+	defer b.tokenMu.Unlock()
 
 	if time.Now().After(b.tokenEx) {
 		if err := b.refreshAccessToken(ctx); err != nil {
@@ -217,6 +209,8 @@ func (b *GoogleBackend) getValidToken(ctx context.Context) (string, error) {
 	return b.token, nil
 }
 
+// Upload writes a file to Google Drive and caches its ID immediately.
+// FIX: parse and store the returned file ID so Delete never needs a prior ListQuery.
 func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Reader) error {
 	tok, err := b.getValidToken(ctx)
 	if err != nil {
@@ -230,26 +224,24 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 		defer pw.Close()
 		defer metaWriter.Close()
 
-		// Part 1: Metadata
 		h := make(textproto.MIMEHeader)
 		h.Set("Content-Type", "application/json; charset=UTF-8")
 		part1, _ := metaWriter.CreatePart(h)
-		meta := map[string]interface{}{
-			"name": filename,
-		}
+		meta := map[string]interface{}{"name": filename}
 		if b.folderID != "" {
 			meta["parents"] = []string{b.folderID}
 		}
 		json.NewEncoder(part1).Encode(meta)
 
-		// Part 2: Content
 		h = make(textproto.MIMEHeader)
 		h.Set("Content-Type", "application/octet-stream")
 		part2, _ := metaWriter.CreatePart(h)
 		io.Copy(part2, data)
 	}()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", pr)
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		"https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id",
+		pr)
 	if err != nil {
 		return err
 	}
@@ -266,68 +258,97 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("upload returned %d: %s", resp.StatusCode, string(body))
 	}
+
+	// FIX: cache the file ID returned by Drive — eliminates ListQuery dependency for Delete
+	var resData struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err == nil && resData.ID != "" {
+		b.fileIdsMu.Lock()
+		b.fileIDs[filename] = resData.ID
+		b.fileIdsMu.Unlock()
+	}
+
 	return nil
 }
 
+// ListQuery lists files in the Drive folder and filters by prefix client-side.
+//
+// FIX: Uses folder listing ("X in parents") instead of "name contains" search.
+// The Drive search index is eventually consistent (2-10s delay after upload).
+// Folder listing is real-time — this is the primary latency fix for downloads.
+//
+// FIX: pageToken loop so files are never missed when >1000 are pending.
 func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string, error) {
 	tok, err := b.getValidToken(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	q := fmt.Sprintf("name contains '%s'", prefix)
-	if b.folderID != "" {
-		q += fmt.Sprintf(" and '%s' in parents", b.folderID)
-	}
-
-	u, _ := url.Parse("https://www.googleapis.com/drive/v3/files")
-	v := u.Query()
-	v.Set("q", q)
-	v.Set("fields", "files(id, name)")
-	u.RawQuery = v.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-
-	resp, err := b.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("list returned %d: %s", resp.StatusCode, string(body))
-	}
-
-	var resData struct {
-		Files []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"files"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
-		return nil, err
-	}
-
-	b.fileIdsMu.Lock()
-	// SAFETY: Prevent fileIDs map from infinite growth
-	if len(b.fileIDs) > 2000 {
-		b.fileIDs = make(map[string]string)
-	}
-
 	var names []string
-	for _, f := range resData.Files {
-		// Only collect exact prefix matches client-side just in case
-		if strings.HasPrefix(f.Name, prefix) {
-			b.fileIDs[f.Name] = f.ID
-			names = append(names, f.Name)
+	pageToken := ""
+
+	for {
+		q := fmt.Sprintf("'%s' in parents and trashed = false", b.folderID)
+
+		u, _ := url.Parse("https://www.googleapis.com/drive/v3/files")
+		v := u.Query()
+		v.Set("q", q)
+		v.Set("fields", "nextPageToken,files(id,name)")
+		v.Set("pageSize", "1000")
+		v.Set("orderBy", "createdTime desc") // newest files first
+		if pageToken != "" {
+			v.Set("pageToken", pageToken)
 		}
+		u.RawQuery = v.Encode()
+
+		req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+
+		resp, err := b.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, fmt.Errorf("list returned %d: %s", resp.StatusCode, string(body))
+		}
+
+		var resData struct {
+			NextPageToken string `json:"nextPageToken"`
+			Files         []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"files"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+		resp.Body.Close()
+
+		b.fileIdsMu.Lock()
+		if len(b.fileIDs) > 2000 {
+			b.fileIDs = make(map[string]string)
+		}
+		for _, f := range resData.Files {
+			b.fileIDs[f.Name] = f.ID // cache all IDs we see
+			if strings.HasPrefix(f.Name, prefix) {
+				names = append(names, f.Name)
+			}
+		}
+		b.fileIdsMu.Unlock()
+
+		if resData.NextPageToken == "" {
+			break
+		}
+		pageToken = resData.NextPageToken
 	}
-	b.fileIdsMu.Unlock()
 
 	return names, nil
 }
@@ -338,7 +359,7 @@ func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadC
 	b.fileIdsMu.RUnlock()
 
 	if !ok {
-		return nil, fmt.Errorf("file-id mapping not found for %s", filename)
+		return nil, fmt.Errorf("404: file-id mapping not found for %s", filename)
 	}
 
 	tok, err := b.getValidToken(ctx)
@@ -346,7 +367,8 @@ func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadC
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://www.googleapis.com/drive/v3/files/"+fileID+"?alt=media", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET",
+		"https://www.googleapis.com/drive/v3/files/"+fileID+"?alt=media", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -380,7 +402,8 @@ func (b *GoogleBackend) Delete(ctx context.Context, filename string) error {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "DELETE", "https://www.googleapis.com/drive/v3/files/"+fileID, nil)
+	req, err := http.NewRequestWithContext(ctx, "DELETE",
+		"https://www.googleapis.com/drive/v3/files/"+fileID, nil)
 	if err != nil {
 		return err
 	}
@@ -416,7 +439,8 @@ func (b *GoogleBackend) CreateFolder(ctx context.Context, name string) (string, 
 	}
 	body, _ := json.Marshal(meta)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://www.googleapis.com/drive/v3/files", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		"https://www.googleapis.com/drive/v3/files", bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -455,7 +479,7 @@ func (b *GoogleBackend) FindFolder(ctx context.Context, name string) (string, er
 	u, _ := url.Parse("https://www.googleapis.com/drive/v3/files")
 	v := u.Query()
 	v.Set("q", q)
-	v.Set("fields", "files(id, name)")
+	v.Set("fields", "files(id,name)")
 	u.RawQuery = v.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
