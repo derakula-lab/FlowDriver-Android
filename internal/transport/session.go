@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"log"
 	"sync"
 	"time"
 )
@@ -13,6 +14,11 @@ const (
 	DirRes Direction = "res"
 )
 
+type queuedEnvelope struct {
+	env        *Envelope
+	receivedAt time.Time
+}
+
 // Session represents an active proxy connection mapped to files.
 type Session struct {
 	ID           string
@@ -20,26 +26,28 @@ type Session struct {
 	txBuf        []byte
 	txSeq        uint64
 	rxSeq        uint64
-	rxQueue      map[uint64]*Envelope
+	rxQueue      map[uint64]*queuedEnvelope
 	lastActivity time.Time
 	closed       bool
-	rxClosed     bool // Safely tracks if RxChan was successfully closed
+	rxClosed     bool
 	TargetAddr   string
 	ClientID     string
 
-	// Backpressure: blocked when txBuf is too large
 	txCond *sync.Cond
-
-	// App channel for receiving data downloaded from remote
 	RxChan chan []byte
+
+	lastTimeoutCheck time.Time
+
+
 }
 
 func NewSession(id string) *Session {
 	s := &Session{
 		ID:           id,
-		rxQueue:      make(map[uint64]*Envelope),
+		rxQueue:      make(map[uint64]*queuedEnvelope),
 		lastActivity: time.Now(),
-		RxChan:       make(chan []byte, 1024),
+		RxChan:           make(chan []byte, 65536),
+		lastTimeoutCheck: time.Now(),
 	}
 	s.txCond = sync.NewCond(&s.mu)
 	return s
@@ -49,9 +57,7 @@ func (s *Session) EnqueueTx(data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// BACKPRESSURE: Block if txBuf is larger than 2MB
-	// This prevents memory explosion when uploading through the proxy
-	for len(s.txBuf) > 2*1024*1024 && !s.closed {
+	for len(s.txBuf) > 8*1024*1024 && !s.closed {
 		s.txCond.Wait()
 	}
 
@@ -62,50 +68,100 @@ func (s *Session) EnqueueTx(data []byte) {
 func (s *Session) ClearTx() {
 	s.mu.Lock()
 	s.txBuf = nil
-	s.txCond.Broadcast() // Wake up any writers blocked on backpressure
+	s.txCond.Broadcast()
 	s.mu.Unlock()
 }
 
 func (s *Session) ProcessRx(env *Envelope) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.lastActivity = time.Now()
 
 	if s.rxClosed {
-		return // Ignore packets if the channel is already safely closed
+		s.mu.Unlock()
+		return
 	}
+
+	if time.Since(s.lastTimeoutCheck) > 5*time.Second {
+		s.lastTimeoutCheck = time.Now()
+		for seq, item := range s.rxQueue {
+			if time.Since(item.receivedAt) > 60*time.Second {
+				log.Printf("Session %s: rxQueue timeout on seq %d — closing", s.ID, seq)
+				s.closed = true
+				s.rxClosed = true
+				close(s.RxChan)
+				s.mu.Unlock()
+				return
+			}
+		}
+	}
+
+	s.lastActivity = time.Now()
+
+	var toSend [][]byte
+	shouldClose := false
 
 	if env.Seq == s.rxSeq {
 		if len(env.Payload) > 0 {
-			s.RxChan <- env.Payload
+			toSend = append(toSend, env.Payload)
 		}
 		s.rxSeq++
-		if env.Close {
-			s.rxClosed = true
-			s.closed = true
-			close(s.RxChan)
-			return
-		}
 
-		// process any queued future packets
-		for {
-			if nextEnv, ok := s.rxQueue[s.rxSeq]; ok {
-				if len(nextEnv.Payload) > 0 {
-					s.RxChan <- nextEnv.Payload
+		if env.Close {
+			shouldClose = true
+		} else {
+			for {
+				nextItem, ok := s.rxQueue[s.rxSeq]
+				if !ok {
+					break
+				}
+				if len(nextItem.env.Payload) > 0 {
+					toSend = append(toSend, nextItem.env.Payload)
 				}
 				delete(s.rxQueue, s.rxSeq)
 				s.rxSeq++
-				if nextEnv.Close {
-					s.rxClosed = true
-					s.closed = true
-					close(s.RxChan)
-					return
+				if nextItem.env.Close {
+					shouldClose = true
+					break
 				}
-			} else {
-				break
 			}
 		}
+
+		if shouldClose {
+			s.rxClosed = true
+			s.closed = true
+		}
 	} else if env.Seq > s.rxSeq {
-		s.rxQueue[env.Seq] = env
+		s.rxQueue[env.Seq] = &queuedEnvelope{
+			env:        env,
+			receivedAt: time.Now(),
+		}
 	}
+
+	s.mu.Unlock()
+
+    for _, payload := range toSend {
+        timer := time.NewTimer(30 * time.Second)
+        select {
+        case s.RxChan <- payload:
+            timer.Stop()
+        case <-timer.C:
+            log.Printf("Session %s: RxChan send timeout", s.ID)
+            s.mu.Lock()
+            if !s.rxClosed {
+                s.closed = true
+                s.rxClosed = true
+                close(s.RxChan)
+            }
+            s.mu.Unlock()
+            return
+        }
+    }
+
+    if shouldClose {
+        s.mu.Lock()
+        if !s.rxClosed {
+            s.rxClosed = true
+            close(s.RxChan)
+        }
+        s.mu.Unlock()
+    }
 }
