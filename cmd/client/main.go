@@ -130,7 +130,7 @@ func main() {
 
 			// Instantly ping a blank payload so the remote end opens the actual TCP destination
 			session.EnqueueTx(nil)
-
+            engine.TriggerFlush()
 			return transport.NewVirtualConn(session, engine), nil
 		}),
 		socks5.WithAssociateHandle(func(ctx context.Context, w io.Writer, req *socks5.Request) error {
